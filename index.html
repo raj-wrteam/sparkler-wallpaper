@@ -4,13 +4,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Fireworks Shader</title>
+    <title>Sparkler Animation Wallpaper</title>
     <style>
-        body {
+        * {
             margin: 0;
             padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
             overflow: hidden;
             background: #000;
+            cursor: none;
         }
 
         canvas {
@@ -19,119 +24,388 @@
             height: 100vh;
         }
 
-        .info {
-            position: absolute;
+        #info {
+            position: fixed;
             top: 10px;
             left: 10px;
-            color: #fff;
-            font-family: monospace;
+            color: rgba(255, 255, 255, 0.3);
+            font-family: 'Courier New', monospace;
             font-size: 12px;
-            background: rgba(0, 0, 0, 0.5);
-            padding: 5px 10px;
-            border-radius: 3px;
+            pointer-events: none;
+            z-index: 10;
+            text-shadow: 0 0 5px rgba(0, 0, 0, 0.5);
         }
     </style>
 </head>
 
 <body>
     <canvas id="canvas"></canvas>
-    <div class="info">Fireworks Shader • Click to reset</div>
+    <div id="info">Move mouse to rotate view</div>
 
     <script>
-        const vertexShaderSource = `
-            attribute vec2 position;
+        const canvas = document.getElementById('canvas');
+        const gl = canvas.getContext('webgl2', {
+            antialias: false,
+            preserveDrawingBuffer: true,
+            powerPreference: "high-performance"
+        });
+
+        if (!gl) {
+            alert('WebGL2 not supported!');
+            throw new Error('WebGL2 not supported');
+        }
+
+        // Vertex shader - simple quad
+        const vertexShaderSource = `#version 300 es
+            precision highp float;
+            in vec2 position;
             void main() {
                 gl_Position = vec4(position, 0.0, 1.0);
             }
         `;
 
-        const fragmentShaderSource = `
+        // Fragment shader - the main sparkler shader
+        const fragmentShaderSource = `#version 300 es
             precision highp float;
             
             uniform vec2 iResolution;
             uniform float iTime;
+            uniform vec2 iMouse;
+            uniform sampler2D iChannel0;
+            uniform sampler2D iChannel1;
             
-            #define PI 3.141592653589793
-            #define EXPLOSION_COUNT 8.
-            #define SPARKS_PER_EXPLOSION 128.
-            #define EXPLOSION_DURATION 20.
-            #define EXPLOSION_SPEED 5.
-            #define EXPLOSION_RADIUS_THESHOLD .06
+            out vec4 fragColor;
             
-            // Hash function by Dave_Hoskins.
+            // Configuration
+            #define NUM_SPARKLES 75.
+            #define NUM_SUB_SPARKLES 3.
+            #define SUB_SPARKLE_CHANCE .4
+            #define PRIMARY_PARTICLE_COLOR vec3(1., 0.8, 0.5)
+            #define SECONDARY_PARTICLE_COLOR vec3(1., 0.5, 0.3)
+            #define MOTION_BLUR_AMOUNT 0.04
+            #define SLOW_MOTION_SPEED .05
+            #define SLOWMO_CYCLE_DURATION 20.
+            #define NORMAL_MOTION_SPEED .9
+            #define DOF vec2(1., 1.5)
+            #define MIN_CAM_DISTANCE 1.5
+            #define MAX_CAM_DISTANCE 7.
+
+            float CAMERA_DISTANCE;
+
+            #define PI 3.1415
+            #define S(x,y,z) smoothstep(x,y,z)
+            #define B(x,y,z,w) S(x-z, x+z, w)*S(y+z, y-z, w)
+            #define saturate(x) clamp(x,0.,1.)
+            
+            float dist2(vec2 P0, vec2 P1) { vec2 D=P1-P0; return dot(D,D); }
+            float DistSqr(vec3 a, vec3 b) { vec3 D=a-b; return dot(D, D); } 
+
+            const vec3 up = vec3(0.,1.,0.);
+            const float pi = 3.141592653589793238;
+            const float twopi = 6.283185307179586;
+
+            vec4 Noise401( vec4 x ) { return fract(sin(x)*5346.1764); }
+            vec4 Noise4( vec4 x ) { return fract(sin(x)*5346.1764)*2. - 1.; }
+            float Noise101( float x ) { return fract(sin(x)*5346.1764); }
+
             #define MOD3 vec3(.1031,.11369,.13787)
             
             vec3 hash31(float p) {
-                vec3 p3 = fract(vec3(p) * MOD3);
-                p3 += dot(p3, p3.yzx + 19.19);
-                return fract(vec3((p3.x + p3.y) * p3.z, (p3.x + p3.z) * p3.y, (p3.y + p3.z) * p3.x));
+               vec3 p3 = fract(vec3(p) * MOD3);
+               p3 += dot(p3, p3.yzx + 19.19);
+               return fract(vec3((p3.x + p3.y)*p3.z, (p3.x+p3.z)*p3.y, (p3.y+p3.z)*p3.x));
             }
             
-            void main() {
-                vec2 fragCoord = gl_FragCoord.xy;
-                float aspectRatio = iResolution.x / iResolution.y;
-                vec2 uv = fragCoord / iResolution.y;
-                float t = mod(iTime + 10., 7200.);
-                vec3 col = vec3(0.); 
-                vec2 origin = vec2(0.);
+            float hash12(vec2 p){
+                vec3 p3  = fract(vec3(p.xyx) * MOD3);
+                p3 += dot(p3, p3.yzx + 19.19);
+                return fract((p3.x + p3.y) * p3.z);
+            }
+
+            struct ray {
+                vec3 o;
+                vec3 d;
+            };
+            ray e;
+
+            struct camera {
+                vec3 p;
+                vec3 forward;
+                vec3 left;
+                vec3 up;
+                vec3 center;
+                vec3 i;
+                ray ray;
+                vec3 lookAt;
+                float zoom;
+            };
+            camera cam;
+
+            float within(vec2 v, float t) {
+                return (t-v.x) / (v.y-v.x);
+            }
+
+            vec4 tex3D( in vec3 pos, in vec3 normal, sampler2D sampler ) {
+                return  texture( sampler, pos.yz )*abs(normal.x)+ 
+                        texture( sampler, pos.xz )*abs(normal.y)+ 
+                        texture( sampler, pos.xy )*abs(normal.z);
+            }
+
+            float sdCapsule( vec3 p, vec3 a, vec3 b, float r ) {
+                vec3 pa = p-a, ba = b-a;
+                float h = clamp( dot(pa,ba)/dot(ba,ba), 0.0, 1.0 );
+                return length( pa - ba*h ) - r;
+            }
+
+            vec4 map( in vec3 p) {
+                float t = iTime*.1;
+                vec2 fryInterval = vec2(2., 2.2);
+                float transition = saturate(within(fryInterval, p.y));
+                transition = smoothstep(0., 1., transition);
                 
-                for (float j = 0.; j < EXPLOSION_COUNT; ++j) {
-                    vec3 oh = hash31((j + 1234.1939) * 641.6974);
-                    origin = vec2(oh.x, oh.y) * .6 + .2; // .2 - .8 to avoid boundaries
-                    origin.x *= aspectRatio;
-                    // Change t value to randomize the spawning of explosions
-                    t += (j + 1.) * 9.6491 * oh.z;
+                vec3 pos = p*3.;
+                pos.y -= t;
+                
+                vec3 normal = normalize(vec3(p.x, 0., p.z));
+                
+                float newBump = tex3D(pos, normal, iChannel1).x*.003;
+                float burnedBump = tex3D(pos, normal, iChannel0).x*.05;
+                
+                float bump = mix(newBump, burnedBump, transition);
+                
+                float d = sdCapsule(p+bump*normal, vec3(0., -10., 0.), vec3(0., 10., 0.), .1);
+                
+                return vec4(d, bump, transition, 2.);
+            }
+
+            vec4 castRay( in vec3 ro, in vec3 rd ) {
+                float dmin = 1.0;
+                float dmax = 20.0;
+                
+                float precis = 0.002;
+                float d = dmin;
+                float m = -1.0;
+                float b = 0.;
+                float t = 0.;
+                for( int i=0; i<50; i++ )
+                {
+                    vec4 res = map( ro+rd*d );
+                    if( res.x<precis || d>dmax ) break;
+                    d += res.x;
+                    b = res.y;
+                    t = res.z;
+                    m = res.w;
+                }
+
+                if( d>dmax ) m=-1.0;
+                return vec4( d, b, t, m );
+            }
+
+            float calcAO( in vec3 pos, in vec3 nor ) {
+                float occ = 0.0;
+                float sca = 1.0;
+                for( int i=0; i<5; i++ )
+                {
+                    float hr = 0.01 + 0.12*float(i)/4.0;
+                    vec3 aopos =  nor * hr + pos;
+                    float dd = map( aopos ).x;
+                    occ += -(dd-hr)*sca;
+                    sca *= 0.95;
+                }
+                return clamp( 1.0 - 3.0*occ, 0.0, 1.0 );    
+            }
+
+            vec3 calcNormal( in vec3 pos )
+            {
+                vec3 eps = vec3( 0.001, 0.0, 0.0 );
+                vec3 nor = vec3(
+                    map(pos+eps.xyy).x - map(pos-eps.xyy).x,
+                    map(pos+eps.yxy).x - map(pos-eps.yxy).x,
+                    map(pos+eps.yyx).x - map(pos-eps.yyx).x );
+                return normalize(nor);
+            }
+
+            void CameraSetup(vec2 uv, vec3 position, vec3 lookAt, float zoom) {
+                cam.p = position;
+                cam.lookAt = lookAt;
+                cam.forward = normalize(cam.lookAt-cam.p);
+                cam.left = cross(up, cam.forward);
+                cam.up = cross(cam.forward, cam.left);
+                cam.zoom = zoom;
+                
+                cam.center = cam.p+cam.forward*cam.zoom;
+                cam.i = cam.center+cam.left*uv.x+cam.up*uv.y;
+                
+                cam.ray.o = cam.p;
+                cam.ray.d = normalize(cam.i-cam.p);
+            }
+
+            vec3 ClosestPoint(ray r, vec3 p) {
+                return r.o + max(0., dot(p-r.o, r.d))*r.d;
+            }
+
+            vec4 render( in vec3 ro, in vec3 rd, out float d ) {
+                vec3 col = vec3(0.);
+                vec4 res = castRay(ro,rd);
+                d = res.x;
+                float b = res.y;
+                float t = res.z;
+                float m = res.w;
+                if( m>0.5 )
+                {
+                    vec3 pos = ro + d*rd;
+                    vec3 nor = calcNormal( pos );
+                    vec3 ref = reflect( rd, nor );
                     
-                    for (float i = 0.; i < SPARKS_PER_EXPLOSION; ++i) {
-                        // Thanks Dave_Hoskins for the suggestion
-                        vec3 h = hash31(j * 963.31 + i + 497.8943);
-                        // random angle (0 - 2*PI)
-                        float a = h.x * PI * 2.;
-                        // random radius scale for spawning points anywhere in a circle
-                        float rScale = h.y * EXPLOSION_RADIUS_THESHOLD;
-                        // explosion loop based on time
-                        if (mod(t * EXPLOSION_SPEED, EXPLOSION_DURATION) > 2.) {
-                            // random radius 
-                            float r = mod(t * EXPLOSION_SPEED, EXPLOSION_DURATION) * rScale;
-                            // explosion spark polar coords 
-                            vec2 sparkPos = vec2(r * cos(a), r * sin(a));
-                            // fake-ish gravity
-                            float poopoo = 0.04;
-                            float peepee = (length(sparkPos) - (rScale - poopoo)) / poopoo;
-                            sparkPos.y -= pow(peepee, 3.0) * 6e-5;
-                            // shiny spark particles
-                            float spark = .0002/pow(length(uv - sparkPos - origin), 1.65);
-                            // Make the explosion spark shimmer/sparkle
-                            float sd = 2. * length(origin-sparkPos);
-                            float shimmer = max(0., sqrt(sd) * (sin((t + h.y * 2. * PI) * 20.)));
-                            float shimmerThreshold = EXPLOSION_DURATION * .32;
-                            // fade the particles towards the end of explosion
-                            float fade = max(0., (EXPLOSION_DURATION - 5.) * rScale - r);
-                            // mix it all together
-                            col += spark * mix(1., shimmer, smoothstep(shimmerThreshold * rScale,
-                                (shimmerThreshold + 1.) * rScale , r)) * fade * oh;
-                        }
+                    col = vec3(0.05,0.08,0.10)+mix(.35, .1, t);
+
+                    float occ = calcAO( pos, nor );
+                    vec3  lig = normalize( vec3(-0.6, 0.7, -0.5) );
+                    float amb = clamp( 0.5+0.5*nor.y, 0.0, 1.0 );
+                    float dif = clamp( dot( nor, lig ), 0.0, 1.0 );
+                    
+                    float fade = saturate(within(vec2(2., 3.), pos.y));
+                    fade = smoothstep(0., 1., fade);
+                    fade = mix(80., 0., fade);
+                    vec3 afterGlow = pow(abs(b)*fade,2.) * vec3(1., .1, .02)*2.;
+                    float whiteGlow = B(2.18, 2.45, .05, pos.y+b*10.);
+
+                    vec3 lin = vec3(0.0);
+                    lin += amb;
+                    lin += dif;
+                    
+                    col = col*lin;
+                    
+                    col += afterGlow;
+                    col += whiteGlow;
+                }
+
+                return vec4( saturate(col), saturate(m) );
+            }
+
+            float SineWave(vec2 pos, float phase, float frequency, float amplitude, float offset, float thickness, float glow) {
+                float dist = abs(pos.y-(sin(pos.x*frequency+phase)*amplitude-offset));
+                return smoothstep(thickness+glow, thickness, dist);
+            }
+
+            vec3 background(ray r) {
+                float x = atan(r.d.x, r.d.z);
+                float y = pi*0.5-acos(r.d.y);
+                
+                float t = iTime;
+                
+                float band1 = SineWave(vec2(x, y), 0., 3., .25, 0., 0.001, .5);
+                
+                return  mix(vec3(.3, .02, 0.03), vec3(0.), band1);
+            }
+
+            vec3 sparkle(ray r, vec3 p, float size, vec3 color) {
+                float camDist = length(cam.p-p);
+                float focus = smoothstep(DOF.y, DOF.x, abs(camDist-CAMERA_DISTANCE));
+                
+                vec3 closestPoint = ClosestPoint(r, p);
+                float dist = DistSqr(closestPoint, p)*10000.;
+               
+                size = mix(size*5., size, focus);
+                float brightness = size/dist;
+                brightness = clamp(brightness,0., 10.);
+                
+                float bokeh = smoothstep(.01, .04, brightness)*saturate(dist*.005+.4)*.15;
+                
+                brightness = mix(bokeh, brightness, focus);
+                return color * brightness;
+            }
+
+            vec3 sparkles(ray r, vec2 uv, float time, float timeFactor, float dist) {
+                vec3 col = vec3(0.);
+                
+                float n2 = fract(sin(uv.x*123134.2345)*1231.234255);
+                float n3 = fract(sin((n2+uv.y)*234.978)*789.234);
+                
+                float motionBlur = (n3-.5)*timeFactor*MOTION_BLUR_AMOUNT;
+                
+                for(float i=0.; i<NUM_SPARKLES; i++) {
+                    float t = time+(i/NUM_SPARKLES) + motionBlur;
+                    float ft = floor(t);
+                    t -= ft;
+                    vec3 n = hash31(i+ft*123.324);
+                    
+                    vec3 pStart = vec3(0., 2.1+n.y*.15, 0.);
+                    pStart.y -= t*t*.6;
+                    pStart.y += t;
+                    
+                    vec3 pEnd = pStart + (n-.5) * vec3(1., .6, 1.)*4.;
+                    vec3 p = mix(pStart, pEnd, t);
+                   
+                    if(length(p-cam.p)<dist) {
+                        float size = mix(10., .5, smoothstep(0., .2, t));
+                        size *= smoothstep(1., .2, t);
+
+                        if(t>n.z && abs(n.z-.55)<SUB_SPARKLE_CHANCE) {
+                            for(float x=0.; x<NUM_SUB_SPARKLES; x++) {
+                                vec3 ns = hash31(x+i);
+                                vec3 sStart = mix(pStart, pEnd, n.z);
+                                vec3 sEnd = sStart + (ns-.5) *2.;
+                                float st = saturate(within(vec2(n.z, 1.), t));
+                                vec3 sp = mix(sStart, sEnd, st);
+
+                                size = mix(10., 0.5, smoothstep(0., .1, st));
+                                size *= smoothstep(1., .9, st);
+
+                                col += sparkle(r, sp, size, SECONDARY_PARTICLE_COLOR);
+                            }
+                        } else
+                             col += sparkle(r, p, size, PRIMARY_PARTICLE_COLOR);
                     }
                 }
                 
-                // evening-sh background gradient
-                col = max(vec3(.1), col);
-                col += vec3(.12, .06, .02) * (1.-uv.y);
-                gl_FragColor = vec4(col, 1.0);
+                return col;
+            }
+
+            vec3 Rainbow(vec3 c) {
+                float t=iTime;
+                c += sin(vec3(.4, .3, .3)*t + vec3(1.1244,3.43215,6.435))*vec3(.4, .1, .5);
+                return c;
+            }
+
+            void main() {
+                vec2 fragCoord = gl_FragCoord.xy;
+                vec2 uv = (fragCoord.xy / iResolution.xy) - 0.5;
+                uv.y *= iResolution.y/iResolution.x;
+                vec2 m = iMouse.xy/iResolution.xy;
+                
+                float t = iTime;
+                float timeFactor = fract(t/SLOWMO_CYCLE_DURATION)>.5 ? SLOW_MOTION_SPEED : NORMAL_MOTION_SPEED;
+                t *= timeFactor;
+                
+                float turn = -m.x*pi*2.+iTime*.1;
+                float s = sin(turn);
+                float c = cos(turn);
+                mat3 rot = mat3(c,  0., s,
+                               0., 1., 0.,
+                               s,  0., -c);
+                
+                CAMERA_DISTANCE = mix(MIN_CAM_DISTANCE, MAX_CAM_DISTANCE, sin(iTime*.0765)*.5+.5);
+                vec3 pos = vec3(0., 0.4, -CAMERA_DISTANCE)*rot;
+               
+                CameraSetup(uv, pos, vec3(0., 2.3, 0.), 1.);
+                
+                vec3 bg = background(cam.ray);
+                float dist;
+                vec4 stick = render(cam.ray.o, cam.ray.d, dist);
+                dist += .08;
+                
+                vec3 col = mix(bg, stick.rgb, stick.a);
+                
+                col += sparkles(cam.ray, uv, t, timeFactor, dist);
+                
+                col = Rainbow(col);
+                
+                fragColor = vec4(col, 1.0);
             }
         `;
 
-        // Initialize WebGL
-        const canvas = document.getElementById('canvas');
-        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
-
-        if (!gl) {
-            alert('WebGL not supported');
-            throw new Error('WebGL not supported');
-        }
-
-        // Create shaders
-        function createShader(gl, type, source) {
+        function createShader(type, source) {
             const shader = gl.createShader(type);
             gl.shaderSource(shader, source);
             gl.compileShader(shader);
@@ -145,8 +419,7 @@
             return shader;
         }
 
-        // Create program
-        function createProgram(gl, vertexShader, fragmentShader) {
+        function createProgram(vertexShader, fragmentShader) {
             const program = gl.createProgram();
             gl.attachShader(program, vertexShader);
             gl.attachShader(program, fragmentShader);
@@ -154,73 +427,121 @@
 
             if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
                 console.error('Program linking error:', gl.getProgramInfoLog(program));
-                gl.deleteProgram(program);
                 return null;
             }
 
             return program;
         }
 
-        // Setup
-        const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
-        const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
-        const program = createProgram(gl, vertexShader, fragmentShader);
+        function createNoiseTexture() {
+            const size = 256;
+            const data = new Uint8Array(size * size * 4);
 
-        // Create buffer for full-screen quad
-        const positionBuffer = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-        const positions = new Float32Array([
+            for (let i = 0; i < size * size * 4; i += 4) {
+                const value = Math.random() * 255;
+                data[i] = value;
+                data[i + 1] = value;
+                data[i + 2] = value;
+                data[i + 3] = 255;
+            }
+
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, size, size, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+
+            return texture;
+        }
+
+        // Initialize shaders
+        const vertexShader = createShader(gl.VERTEX_SHADER, vertexShaderSource);
+        const fragmentShader = createShader(gl.FRAGMENT_SHADER, fragmentShaderSource);
+        const program = createProgram(vertexShader, fragmentShader);
+
+        // Create quad vertices
+        const vertices = new Float32Array([
             -1, -1,
             1, -1,
             -1, 1,
             1, 1
         ]);
-        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
 
-        // Get attribute and uniform locations
+        const buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
         const positionLocation = gl.getAttribLocation(program, 'position');
-        const resolutionLocation = gl.getUniformLocation(program, 'iResolution');
-        const timeLocation = gl.getUniformLocation(program, 'iTime');
+        gl.enableVertexAttribArray(positionLocation);
+        gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
 
-        // Animation state
-        let startTime = Date.now();
-        let timeOffset = 0;
+        // Get uniform locations
+        const uniforms = {
+            iResolution: gl.getUniformLocation(program, 'iResolution'),
+            iTime: gl.getUniformLocation(program, 'iTime'),
+            iMouse: gl.getUniformLocation(program, 'iMouse'),
+            iChannel0: gl.getUniformLocation(program, 'iChannel0'),
+            iChannel1: gl.getUniformLocation(program, 'iChannel1')
+        };
 
-        // Handle window resize
+        // Create noise textures
+        const texture0 = createNoiseTexture();
+        const texture1 = createNoiseTexture();
+
+        // Mouse tracking
+        let mouseX = 0.5;
+        let mouseY = 0.5;
+        let targetMouseX = 0.5;
+        let targetMouseY = 0.5;
+
+        canvas.addEventListener('mousemove', (e) => {
+            targetMouseX = e.clientX / window.innerWidth;
+            targetMouseY = 1.0 - (e.clientY / window.innerHeight);
+        });
+
+        // Touch support for mobile
+        canvas.addEventListener('touchmove', (e) => {
+            if (e.touches.length > 0) {
+                targetMouseX = e.touches[0].clientX / window.innerWidth;
+                targetMouseY = 1.0 - (e.touches[0].clientY / window.innerHeight);
+            }
+        });
+
         function resize() {
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
+            canvas.width = window.innerWidth * window.devicePixelRatio;
+            canvas.height = window.innerHeight * window.devicePixelRatio;
             gl.viewport(0, 0, canvas.width, canvas.height);
         }
 
         window.addEventListener('resize', resize);
         resize();
 
-        // Handle click to reset
-        canvas.addEventListener('click', () => {
-            startTime = Date.now();
-            timeOffset = Math.random() * 100;
-        });
+        const startTime = Date.now();
 
-        // Render loop
         function render() {
-            const currentTime = (Date.now() - startTime) / 1000 + timeOffset;
+            const currentTime = (Date.now() - startTime) * 0.001;
 
-            // Clear canvas
-            gl.clearColor(0, 0, 0, 1);
-            gl.clear(gl.COLOR_BUFFER_BIT);
+            // Smooth mouse movement
+            mouseX += (targetMouseX - mouseX) * 0.05;
+            mouseY += (targetMouseY - mouseY) * 0.05;
 
-            // Use shader program
             gl.useProgram(program);
 
             // Set uniforms
-            gl.uniform2f(resolutionLocation, canvas.width, canvas.height);
-            gl.uniform1f(timeLocation, currentTime);
+            gl.uniform2f(uniforms.iResolution, canvas.width, canvas.height);
+            gl.uniform1f(uniforms.iTime, currentTime);
+            gl.uniform2f(uniforms.iMouse, mouseX * canvas.width, mouseY * canvas.height);
 
-            // Bind position buffer
-            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-            gl.enableVertexAttribArray(positionLocation);
-            gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+            // Bind textures
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, texture0);
+            gl.uniform1i(uniforms.iChannel0, 0);
+
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, texture1);
+            gl.uniform1i(uniforms.iChannel1, 1);
 
             // Draw
             gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -228,7 +549,12 @@
             requestAnimationFrame(render);
         }
 
-        // Start rendering
+        // Hide info text after a few seconds
+        setTimeout(() => {
+            document.getElementById('info').style.opacity = '0';
+            document.getElementById('info').style.transition = 'opacity 2s';
+        }, 5000);
+
         render();
     </script>
 </body>
